@@ -1,16 +1,3 @@
-/**
- * Running a local relay server will allow you to hide your API key
- * and run custom logic on the server
- *
- * Set the local relay server address to:
- * REACT_APP_LOCAL_RELAY_SERVER_URL=http://localhost:8081
- *
- * This will also require you to set OPENAI_API_KEY= in a `.env` file
- * You can run it with `npm run relay`, in parallel with `npm start`
- */
-const LOCAL_RELAY_SERVER_URL: string =
-  process.env.REACT_APP_LOCAL_RELAY_SERVER_URL || '';
-
 import { useEffect, useRef, useCallback, useState } from 'react';
 
 import { RealtimeClient } from '@openai/realtime-api-beta';
@@ -21,15 +8,14 @@ import { WavRenderer } from '../utils/wav_renderer';
 
 import { X, Edit, Zap, ArrowUp, ArrowDown } from 'react-feather';
 import { Button } from '../components/button/Button';
-import { Toggle } from '../components/toggle/Toggle';
-import { Map } from '../components/Map';
-
+import { SimliClient } from 'simli-client';
 import './ConsolePage.scss';
-import { isJsxOpeningLikeElement } from 'typescript';
 
-/**
- * Type for result from get_weather() function call
- */
+
+const LOCAL_RELAY_SERVER_URL: string =
+  process.env.REACT_APP_LOCAL_RELAY_SERVER_URL || '';
+
+
 interface Coordinates {
   lat: number;
   lng: number;
@@ -44,9 +30,7 @@ interface Coordinates {
   };
 }
 
-/**
- * Type for all event logs
- */
+
 interface RealtimeEvent {
   time: string;
   source: 'client' | 'server';
@@ -54,26 +38,41 @@ interface RealtimeEvent {
   event: { [key: string]: any };
 }
 
+function resampleAudioData(
+  inputData: Int16Array,
+  inputSampleRate: number,
+  outputSampleRate: number
+): Int16Array {
+  const sampleRateRatio = inputSampleRate / outputSampleRate;
+  const outputLength = Math.round(inputData.length / sampleRateRatio);
+  const outputData = new Int16Array(outputLength);
+
+  for (let i = 0; i < outputLength; i++) {
+    const sourceIndex = i * sampleRateRatio;
+    const lowerIndex = Math.floor(sourceIndex);
+    const upperIndex = Math.min(lowerIndex + 1, inputData.length - 1);
+    const interpolation = sourceIndex - lowerIndex;
+    outputData[i] =
+      (1 - interpolation) * inputData[lowerIndex] +
+      interpolation * inputData[upperIndex];
+  }
+
+  return outputData;
+}
+
+
+
 export function ConsolePage() {
-  /**
-   * Ask user for API Key
-   * If we're using the local relay server, we don't need this
-   */
   const apiKey = LOCAL_RELAY_SERVER_URL
     ? ''
     : localStorage.getItem('tmp::voice_api_key') ||
-      prompt('OpenAI API Key') ||
-      '';
+    prompt('OpenAI API Key') ||
+    '';
   if (apiKey !== '') {
     localStorage.setItem('tmp::voice_api_key', apiKey);
   }
 
-  /**
-   * Instantiate:
-   * - WavRecorder (speech input)
-   * - WavStreamPlayer (speech output)
-   * - RealtimeClient (API client)
-   */
+
   const [showEvents, setShowEvents] = useState(false);
   const [showConversations, setShowConversations] = useState(false);
 
@@ -88,31 +87,27 @@ export function ConsolePage() {
       LOCAL_RELAY_SERVER_URL
         ? { url: LOCAL_RELAY_SERVER_URL }
         : {
-            apiKey: apiKey,
-            dangerouslyAllowAPIKeyInBrowser: true,
-          }
+          apiKey: apiKey,
+          dangerouslyAllowAPIKeyInBrowser: true,
+        }
     )
   );
 
-  /**
-   * References for
-   * - Rendering audio visualization (canvas)
-   * - Autoscrolling event logs
-   * - Timing delta for event log displays
-   */
+  // Simli refs
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const simliClientRef = useRef<SimliClient | null>(null);
+  const simliAudioBufferRef = useRef<Uint8Array[]>([]);
+
+
+
   const clientCanvasRef = useRef<HTMLCanvasElement>(null);
   const serverCanvasRef = useRef<HTMLCanvasElement>(null);
   const eventsScrollHeightRef = useRef(0);
   const eventsScrollRef = useRef<HTMLDivElement>(null);
   const startTimeRef = useRef<string>(new Date().toISOString());
 
-  /**
-   * All of our variables for displaying application state
-   * - items are all conversation items (dialog)
-   * - realtimeEvents are event logs, which can be expanded
-   * - memoryKv is for set_memory() function
-   * - coords, marker are for get_weather() function
-   */
+
   const [items, setItems] = useState<ItemType[]>([]);
   const [realtimeEvents, setRealtimeEvents] = useState<RealtimeEvent[]>([]);
   const [expandedEvents, setExpandedEvents] = useState<{
@@ -128,9 +123,7 @@ export function ConsolePage() {
   });
   const [marker, setMarker] = useState<Coordinates | null>(null);
 
-  /**
-   * Utility for formatting the timing of logs
-   */
+
   const formatTime = useCallback((timestamp: string) => {
     const startTime = startTimeRef.current;
     const t0 = new Date(startTime).valueOf();
@@ -149,9 +142,7 @@ export function ConsolePage() {
     return `${pad(m)}:${pad(s)}.${pad(hs)}`;
   }, []);
 
-  /**
-   * When you click the API key
-   */
+
   const resetAPIKey = useCallback(() => {
     const apiKey = prompt('OpenAI API Key');
     if (apiKey !== null) {
@@ -160,6 +151,23 @@ export function ConsolePage() {
       window.location.reload();
     }
   }, []);
+
+
+  const isSimliDataChannelOpen = () => {
+    if (!simliClientRef.current) return false;
+
+    // Access internal properties (may vary depending on SimliClient implementation)
+    const pc = (simliClientRef.current as any).pc as RTCPeerConnection | null;
+    const dc = (simliClientRef.current as any).dc as RTCDataChannel | null;
+
+    return (
+      pc !== null &&
+      pc.iceConnectionState === 'connected' &&
+      dc !== null &&
+      dc.readyState === 'open'
+    );
+  };
+
 
   /**
    * Connect to conversation:
@@ -170,11 +178,33 @@ export function ConsolePage() {
     const wavRecorder = wavRecorderRef.current;
     const wavStreamPlayer = wavStreamPlayerRef.current;
 
+    // Define audio constraints for noise suppression, echo cancellation, and auto gain control
+    const constraints = {
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    };
+
     // Set state variables
     startTimeRef.current = new Date().toISOString();
     setIsConnected(true);
     setRealtimeEvents([]);
     setItems(client.conversation.getItems());
+
+    // Start Simli WebRTC connection
+    if (simliClientRef.current) {
+      simliClientRef.current.start();
+
+      // Send empty audio data to Simli
+      const audioData = new Uint8Array(6000).fill(0);
+      simliClientRef.current.sendAudioData(audioData);
+      console.log('Sent initial empty audio data to Simli');
+    }
+
+    // Now connect to OpenAI's realtime API
+    await client.connect();
 
     // Connect to microphone
     await wavRecorder.begin();
@@ -182,20 +212,38 @@ export function ConsolePage() {
     // Connect to audio output
     await wavStreamPlayer.connect();
 
-    // Connect to realtime API
-    await client.connect();
-    client.sendUserMessageContent([
-      {
-        type: `input_text`,
-        text: `Hello!`,
-        // text: `For testing purposes, I want you to list ten car brands. Number each item, e.g. "one (or whatever number you are one): the item name".`
-      },
-    ]);
-
     if (client.getTurnDetectionType() === 'server_vad') {
       await wavRecorder.record((data) => client.appendInputAudio(data.mono));
     }
   }, []);
+
+  const changeVoiceType = async () => {
+    const client = clientRef.current;
+
+    /**
+    // Access the voice setting from the environment variable
+    */
+    // Define allowed voices
+    const allowedVoices: Array<'shimmer' | 'alloy' | 'echo'> = ['shimmer', 'alloy', 'echo'];
+
+    // Get voice from environment variable (defaults to 'shimmer' if not set)
+    const voice = process.env.REACT_APP_VOICE || 'echo';
+
+    // Validate that the voice is one of the allowed options
+    const validVoice = allowedVoices.includes(voice as 'shimmer' | 'alloy' | 'echo')
+      ? (voice as 'shimmer' | 'alloy' | 'echo')
+      : 'shimmer';  // Default to 'shimmer' if invalid
+
+    client.updateSession({
+      voice: validVoice,
+    });
+  };
+
+  // Use useEffect to call the function on component mount
+  useEffect(() => {
+    changeVoiceType();
+  }, []);
+
 
   /**
    * Disconnect and reset conversation state
@@ -205,11 +253,6 @@ export function ConsolePage() {
     setRealtimeEvents([]);
     setItems([]);
     setMemoryKv({});
-    setCoords({
-      lat: 37.775593,
-      lng: -122.418137,
-    });
-    setMarker(null);
 
     const client = clientRef.current;
     client.disconnect();
@@ -219,6 +262,11 @@ export function ConsolePage() {
 
     const wavStreamPlayer = wavStreamPlayerRef.current;
     await wavStreamPlayer.interrupt();
+
+    // Close Simli connection
+    if (simliClientRef.current) {
+      simliClientRef.current.close();
+    }
   }, []);
 
   const deleteConversationItem = useCallback(async (id: string) => {
@@ -378,96 +426,60 @@ export function ConsolePage() {
    * Core RealtimeClient and audio capture setup
    * Set all of our instructions, tools, events and more
    */
+  const [isSimliReady, setIsSimliReady] = useState(false);
+
+
+
   useEffect(() => {
     // Get refs
     const wavStreamPlayer = wavStreamPlayerRef.current;
     const client = clientRef.current;
+
+    // Initialize SimliClient
+    if (videoRef.current && audioRef.current) {
+      const simliApiKey = '7u9k31cjc3350xyfo8tvfq'
+      const simliFaceID = "832c75a8-001f-4a2a-805b-516d4b8ea047";
+
+      if (!simliApiKey || !simliFaceID) {
+        console.error('Simli API key or Face ID is not defined');
+      } else {
+        const SimliConfig = {
+          apiKey: simliApiKey,
+          faceID: simliFaceID,
+          handleSilence: true,
+          videoRef: videoRef,
+          audioRef: audioRef,
+        };
+
+        simliClientRef.current = new SimliClient();
+        simliClientRef.current.Initialize(SimliConfig);
+
+        simliClientRef.current.on('connected', () => {
+          setIsSimliReady(true);
+          console.log('SimliClient connected');
+          // Optionally send an initial command to start the avatar's animation
+          // simliClientRef.current.sendText('Hello');
+        });
+
+        simliClientRef.current.on('error', (error) => {
+          console.error('SimliClient error:', error);
+        });
+
+
+        console.log('Simli Client initialized');
+      }
+    }
 
     // Set instructions
     client.updateSession({ instructions: instructions });
     // Set transcription, otherwise we don't get user transcriptions back
     client.updateSession({ input_audio_transcription: { model: 'whisper-1' } });
 
-    // Add tools
-    // client.addTool(
-    //   {
-    //     name: 'set_memory',
-    //     description: 'Saves important data about the user into memory.',
-    //     parameters: {
-    //       type: 'object',
-    //       properties: {
-    //         key: {
-    //           type: 'string',
-    //           description:
-    //             'The key of the memory value. Always use lowercase and underscores, no other characters.',
-    //         },
-    //         value: {
-    //           type: 'string',
-    //           description: 'Value can be anything represented as a string',
-    //         },
-    //       },
-    //       required: ['key', 'value'],
-    //     },
-    //   },
-    //   async ({ key, value }: { [key: string]: any }) => {
-    //     setMemoryKv((memoryKv) => {
-    //       const newKv = { ...memoryKv };
-    //       newKv[key] = value;
-    //       return newKv;
-    //     });
-    //     return { ok: true };
-    //   }
-    // );
-    // client.addTool(
-    //   {
-    //     name: 'get_weather',
-    //     description:
-    //       'Retrieves the weather for a given lat, lng coordinate pair. Specify a label for the location.',
-    //     parameters: {
-    //       type: 'object',
-    //       properties: {
-    //         lat: {
-    //           type: 'number',
-    //           description: 'Latitude',
-    //         },
-    //         lng: {
-    //           type: 'number',
-    //           description: 'Longitude',
-    //         },
-    //         location: {
-    //           type: 'string',
-    //           description: 'Name of the location',
-    //         },
-    //       },
-    //       required: ['lat', 'lng', 'location'],
-    //     },
-    //   },
-    //   async ({ lat, lng, location }: { [key: string]: any }) => {
-    //     setMarker({ lat, lng, location });
-    //     setCoords({ lat, lng, location });
-    //     const result = await fetch(
-    //       `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m`
-    //     );
-    //     const json = await result.json();
-    //     const temperature = {
-    //       value: json.current.temperature_2m as number,
-    //       units: json.current_units.temperature_2m as string,
-    //     };
-    //     const wind_speed = {
-    //       value: json.current.wind_speed_10m as number,
-    //       units: json.current_units.wind_speed_10m as string,
-    //     };
-    //     setMarker({ lat, lng, location, temperature, wind_speed });
-    //     return json;
-    //   }
-    // );
-
     // handle realtime events from client + server for event logging
     client.on('realtime.event', (realtimeEvent: RealtimeEvent) => {
       setRealtimeEvents((realtimeEvents) => {
         const lastEvent = realtimeEvents[realtimeEvents.length - 1];
         if (lastEvent?.event.type === realtimeEvent.event.type) {
-          // if we receive multiple events in a row, aggregate them for display purposes
           lastEvent.count = (lastEvent.count || 0) + 1;
           return realtimeEvents.slice(0, -1).concat(lastEvent);
         } else {
@@ -477,17 +489,39 @@ export function ConsolePage() {
     });
     client.on('error', (event: any) => console.error(event));
     client.on('conversation.interrupted', async () => {
-      const trackSampleOffset = await wavStreamPlayer.interrupt();
-      if (trackSampleOffset?.trackId) {
-        const { trackId, offset } = trackSampleOffset;
-        await client.cancelResponse(trackId, offset);
-      }
+      // Stop sending further audio data to Simli
+      simliAudioBufferRef.current = [];
+
     });
+
     client.on('conversation.updated', async ({ item, delta }: any) => {
       const items = client.conversation.getItems();
+
       if (delta?.audio) {
-        wavStreamPlayer.add16BitPCM(delta.audio, item.id);
+        if (simliClientRef.current) {
+          const audioData = new Int16Array(delta.audio);
+          const resampledAudioData = resampleAudioData(audioData, 24000, 16000);
+
+          if (isSimliDataChannelOpen()) {
+            // Send buffered audio first
+            if (simliAudioBufferRef.current.length > 0) {
+              simliAudioBufferRef.current.forEach((bufferedData) => {
+                simliClientRef.current!.sendAudioData(bufferedData);
+              });
+              simliAudioBufferRef.current = [];
+            }
+            // Send current resampled audio data
+            const resampledAudioDataUint8 = new Uint8Array(resampledAudioData.buffer);
+            simliClientRef.current.sendAudioData(resampledAudioDataUint8);
+          } else {
+            // Buffer the resampled audio data
+            const resampledAudioDataUint8 = new Uint8Array(resampledAudioData.buffer);
+            simliAudioBufferRef.current.push(resampledAudioDataUint8);
+            console.warn('Data channel is not open yet, buffering audio data');
+          }
+        }
       }
+
       if (item.status === 'completed' && item.formatted.audio?.length) {
         const wavFile = await WavRecorder.decode(
           item.formatted.audio,
@@ -499,11 +533,18 @@ export function ConsolePage() {
       setItems(items);
     });
 
+
+
     setItems(client.conversation.getItems());
 
     return () => {
       // cleanup; resets to defaults
       client.reset();
+
+      // Close SimliClient on unmount
+      if (simliClientRef.current) {
+        simliClientRef.current.close();
+      }
     };
   }, []);
 
@@ -514,7 +555,7 @@ export function ConsolePage() {
     <div data-component="ConsolePage">
       <div className="content-top">
         <div className="content-title">
-          <img src="https://www.enabel.be/app/uploads/2022/06/enabel-logo-color.svg" alt="Enabel Logo" style={{ width: '130px', height: '30px' }}/>
+          <img src="https://www.enabel.be/app/uploads/2022/06/enabel-logo-color.svg" alt="Enabel Logo" style={{ width: '130px', height: '30px' }} />
           {/* <span>realtime console</span> */}
         </div>
         <div className="content-api-key">
@@ -532,150 +573,91 @@ export function ConsolePage() {
       <div className="content-main">
         <div className="content-logs">
           <div className="content-block events">
-            <div className="visualization">
+            {/* <div className="visualization">
               <div className="visualization-entry client">
                 <canvas ref={clientCanvasRef} />
               </div>
               <div className="visualization-entry server">
                 <canvas ref={serverCanvasRef} />
               </div>
-            </div>
+            </div> */}
+
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="video-background"
+            />
+            <audio ref={audioRef} autoPlay />
+
             {/* <div className="content-block-title">events</div> */}
-            <div className="content-block-body" ref={eventsScrollRef}>
-            {showEvents && (
-          <>
-            {!realtimeEvents.length && `awaiting connection...`}
-            {realtimeEvents.map((realtimeEvent, i) => {
-              const count = realtimeEvent.count;
-              const event = { ...realtimeEvent.event };
-              if (event.type === 'input_audio_buffer.append') {
-                event.audio = `[trimmed: ${event.audio.length} bytes]`;
-              } else if (event.type === 'response.audio.delta') {
-                event.delta = `[trimmed: ${event.delta.length} bytes]`;
-              }
-              return (
-                <div className="event" key={event.event_id}>
-                  <div className="event-timestamp">
-                    {formatTime(realtimeEvent.time)}
-                  </div>
-                  <div className="event-details">
-                    <div
-                      className="event-summary"
-                      onClick={() => {
-                        // toggle event details
-                        const id = event.event_id;
-                        const expanded = { ...expandedEvents };
-                        if (expanded[id]) {
-                          delete expanded[id];
-                        } else {
-                          expanded[id] = true;
-                        }
-                        setExpandedEvents(expanded);
-                      }}
-                    >
-                      <div
-                        className={`event-source ${
-                          event.type === 'error'
-                            ? 'error'
-                            : realtimeEvent.source
-                        }`}
-                      >
-                        {realtimeEvent.source === 'client' ? (
-                          <ArrowUp />
-                        ) : (
-                          <ArrowDown />
-                        )}
-                        <span>
-                          {event.type === 'error'
-                            ? 'error!'
-                            : realtimeEvent.source}
-                        </span>
-                      </div>
-                      <div className="event-type">
-                        {event.type}
-                        {count && ` (${count})`}
-                      </div>
-                    </div>
-                    {!!expandedEvents[event.event_id] && (
-                      <div className="event-payload">
-                        {JSON.stringify(event, null, 2)}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </>
-        )}
-            </div>
-          </div>
-          <div className="content-block conversation">
-            {/* <div className="content-block-title">conversation</div> */}
-            <div className="content-block-body" data-conversation-content>
-              {showConversations && (
-              <>
-              {!items.length && `awaiting connection...`}
-              {items.map((conversationItem, i) => {
-                return (
-                  <div className="conversation-item" key={conversationItem.id}>
-                    <div className={`speaker ${conversationItem.role || ''}`}>
-                      <div>
-                        {(
-                          conversationItem.role || conversationItem.type
-                        ).replaceAll('_', ' ')}
-                      </div>
-                      <div
-                        className="close"
-                        onClick={() =>
-                          deleteConversationItem(conversationItem.id)
-                        }
-                      >
-                        <X />
-                      </div>
-                    </div>
-                    <div className={`speaker-content`}>
-                      {/* tool response */}
-                      {conversationItem.type === 'function_call_output' && (
-                        <div>{conversationItem.formatted.output}</div>
-                      )}
-                      {/* tool call */}
-                      {!!conversationItem.formatted.tool && (
-                        <div>
-                          {conversationItem.formatted.tool.name}(
-                          {conversationItem.formatted.tool.arguments})
+            {/* <div className="content-block-body" ref={eventsScrollRef}>
+              {showEvents && (
+                <>
+                  {!realtimeEvents.length && `awaiting connection...`}
+                  {realtimeEvents.map((realtimeEvent, i) => {
+                    const count = realtimeEvent.count;
+                    const event = { ...realtimeEvent.event };
+                    if (event.type === 'input_audio_buffer.append') {
+                      event.audio = `[trimmed: ${event.audio.length} bytes]`;
+                    } else if (event.type === 'response.audio.delta') {
+                      event.delta = `[trimmed: ${event.delta.length} bytes]`;
+                    }
+                    return (
+                      <div className="event" key={event.event_id}>
+                        <div className="event-timestamp">
+                          {formatTime(realtimeEvent.time)}
                         </div>
-                      )}
-                      {!conversationItem.formatted.tool &&
-                        conversationItem.role === 'user' && (
-                          <div>
-                            {conversationItem.formatted.transcript ||
-                              (conversationItem.formatted.audio?.length
-                                ? '(awaiting transcript)'
-                                : conversationItem.formatted.text ||
-                                  '(item sent)')}
+                        <div className="event-details">
+                          <div
+                            className="event-summary"
+                            onClick={() => {
+                              // toggle event details
+                              const id = event.event_id;
+                              const expanded = { ...expandedEvents };
+                              if (expanded[id]) {
+                                delete expanded[id];
+                              } else {
+                                expanded[id] = true;
+                              }
+                              setExpandedEvents(expanded);
+                            }}
+                          >
+                            <div
+                              className={`event-source ${event.type === 'error'
+                                ? 'error'
+                                : realtimeEvent.source
+                                }`}
+                            >
+                              {realtimeEvent.source === 'client' ? (
+                                <ArrowUp />
+                              ) : (
+                                <ArrowDown />
+                              )}
+                              <span>
+                                {event.type === 'error'
+                                  ? 'error!'
+                                  : realtimeEvent.source}
+                              </span>
+                            </div>
+                            <div className="event-type">
+                              {event.type}
+                              {count && ` (${count})`}
+                            </div>
                           </div>
-                        )}
-                      {!conversationItem.formatted.tool &&
-                        conversationItem.role === 'assistant' && (
-                          <div>
-                            {conversationItem.formatted.transcript ||
-                              conversationItem.formatted.text ||
-                              '(truncated)'}
-                          </div>
-                        )}
-                      {conversationItem.formatted.file && (
-                        <audio
-                          src={conversationItem.formatted.file.url}
-                          controls
-                        />
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-              </>
+                          {!!expandedEvents[event.event_id] && (
+                            <div className="event-payload">
+                              {JSON.stringify(event, null, 2)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
               )}
-            </div>
+            </div> */}
           </div>
           <div className="content-actions">
             {/* <Toggle
@@ -696,7 +678,7 @@ export function ConsolePage() {
             )} */}
             {/* <div className="spacer" /> */}
             <Button
-              label={isConnected ? 'disconnect' : 'connect'}
+              label={isConnected ? 'Disconnect' : 'Connect'}
               iconPosition={isConnected ? 'end' : 'start'}
               icon={isConnected ? X : Zap}
               buttonStyle={isConnected ? 'regular' : 'action'}
