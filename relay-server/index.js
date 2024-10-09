@@ -2,7 +2,7 @@ import { RealtimeRelay } from './lib/relay.js';
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 
-const OPENAI_API_KEY = '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';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (!OPENAI_API_KEY) {
   console.error(
